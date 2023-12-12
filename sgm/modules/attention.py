@@ -633,19 +633,21 @@ class SpatialTransformer(nn.Module):
         return x + x_in
 
 #import loralib as lora 
-def search_lora_weights(name, lora_dicts):
-    weights = lora_dicts['weights']
+from punica import add_lora_sgmv_custom_cutlass as add_lora
+def search_punica_weights(name, weights):
     if weights:
-        alpha = 'lora_'+ name + '.alpha'
-        lora_down = 'lora_' + name + '.lora_down.weight'
-        lora_up = 'lora_' + name + '.lora_up.weight'
-        alpha = weights.get(alpha)
-        lora_down = weights.get(lora_down)
-        lora_up = weights.get(lora_up)
-        if alpha:
-            r = lora_dicts['rank']
-            return alpha, lora_down, lora_up, r
-    return None, None, None, None
+        name = 'lora_'+ name
+        weights = weights.get(name)
+        if weights:
+            r = 32
+            alpha = 32
+            s = torch.cumsum(
+                torch.tensor([0] + [1], dtype=torch.int32, device=weights.wa_ptr.device),
+                dim=0,
+                dtype=torch.int32,
+            )
+            return weights, alpha, r, s
+    return None,None,None,None
 
 class SpatialTransformerLoRA(nn.Module):
     """
@@ -744,19 +746,29 @@ class SpatialTransformerLoRA(nn.Module):
         if not self.use_linear:
             x = self.proj_in(x)
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
-        x_copy = x.clone() 
+
+        x_copy = x.clone().to(x.dtype)
         if self.use_linear:
             x = self.proj_in(x)
 
         if lora_dicts is not None:
             name = self.proj_in_name
-            for i in range(x_copy.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(name, lora_dicts[i])
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    x[i] += (x_copy[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                print(x[:,0,:].shape, x_copy[:,0,:].shape)
+                for i in range(x.shape[1]):
+                    t1 = x[:,i,:].contiguous()
+                    t2 = x_copy[:,i,:].contiguous()
+                    add_lora(
+                        y=t1,
+                        x=t2,
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )
+                    x[:,i,:] = t1
 
         for i, block in enumerate(self.transformer_blocks):
             if i > 0 and len(context) == 1:
@@ -769,14 +781,18 @@ class SpatialTransformerLoRA(nn.Module):
 
         if lora_dicts is not None:
             name = self.proj_out_name
-            for i in range(x.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    x[i] += (x_copy[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
-
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(x.shape[1]):
+                    add_lora(
+                        y=x[i],
+                        x=x_copy[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )
 
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
         if not self.use_linear:
@@ -834,27 +850,47 @@ class MemoryEfficientCrossAttentionLoRA(nn.Module):
         v = self.to_v(context)
 
         if lora_dicts is not None:
-            for i in range(x.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(self.to_q_name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    q[i] += (x[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            name = self.to_q_name
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(x.shape[1]):
+                    add_lora(
+                        y=q[i],
+                        x=x[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )
 
-                alpha, lora_down, lora_up, r = search_lora_weights(self.to_k_name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    k[i] += (context[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            name = self.to_k_name
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(context.shape[1]):
+                    add_lora(
+                        y=k[i],
+                        x=context[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )
 
-                alpha, lora_down, lora_up, r = search_lora_weights(self.to_v_name, lora_dicts[i])
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    v[i] += (context[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            name = self.to_v_name   
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(context.shape[1]):
+                    add_lora(
+                        y=v[i],
+                        x=context[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )          
 
         if n_times_crossframe_attn_in_self:
             # reprogramming cross-frame attention as in https://arxiv.org/abs/2303.13439
@@ -902,13 +938,19 @@ class MemoryEfficientCrossAttentionLoRA(nn.Module):
         out = self.to_out(out)
 
         if lora_dicts is not None:
-            for i in range(out.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(self.to_out_name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    out[i] += (out_copy[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            name = self.to_out_name
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(out.shape[1]):
+                    add_lora(
+                        y=out[i],
+                        x=out_copy[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )   
         return out
 
 class GEGLULoRA(nn.Module):
@@ -921,17 +963,21 @@ class GEGLULoRA(nn.Module):
     def forward(self, x, lora_dicts=None):
         if lora_dicts is not None:
             x_copy = x.clone()
-            x, gate = self.proj(x).chunk(2, dim=-1)
-            for i in range(x.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(self.proj_name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    t = (x_copy[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
-                    t1, t2 = t.chunk(2, dim=-1)
-                    x[i] += t1
-                    gate[i] += t2  
+            temp = self.proj(x)
+            name = self.proj_name
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(x.shape[1]):
+                    add_lora(
+                        y=temp[i],
+                        x=x_copy[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )   
+            x,gate = temp.chunk(2, dim=-1)
         else:
             x, gate = self.proj(x).chunk(2, dim=-1)
         return x * F.gelu(gate)
@@ -961,13 +1007,19 @@ class FeedForwardLoRA(nn.Module):
             x = self.net[1](x)
             x_copy = x.clone()
             x = self.net[2](x)
-            for i in range(x.shape[0]):
-                alpha, lora_down, lora_up, r = search_lora_weights(self.out_name, lora_dicts[i]) 
-                if alpha is not None:
-                    alpha = alpha.to(x.device)
-                    lora_down = lora_down.to(x.device)
-                    lora_up = lora_up.to(x.device)
-                    x[i] += (x_copy[i] @ lora_down.transpose(0, 1) @ lora_up.transpose(0, 1)) * (alpha / r)
+            name = self.out_name
+            weights,alpha,r,s = search_punica_weights(name, lora_dicts)
+            if weights:
+                for i in range(x.shape[1]):
+                    add_lora(
+                        y=x[i],
+                        x=x_copy[i],
+                        wa_ptr=weights.wa_ptr,
+                        wb_ptr=weights.wb_ptr,
+                        s=s,
+                        layer_idx=0,
+                        lora_rank=r,
+                    )   
         else:
             x = self.net(x)
         return x

@@ -4,45 +4,11 @@ from sgm.modules.diffusionmodules.sampling import *
 import time,peft
 import threading
 import argparse
-from punica import LoraWeight,BatchedLoraWeight
 
 wait_to_encode = []
 wait_to_sample = []
 wait_to_decode = []
 wait_to_refine = []
-
-def split_dict(dictionary, chunk_size):
-    result = []
-    keys = list(dictionary.keys())
-    for i in range(0, len(keys), chunk_size):
-        chunk = {key: dictionary[key] for key in keys[i:i+chunk_size]}
-        result.append(chunk)
-    return result
-
-class SDLoraWeight:
-    def __init__(
-        self,
-        lora_dicts: Dict[str, torch.Tensor],
-        lora_rank: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ):
-        lora_weights = {}
-        chunks = split_dict(lora_dicts, 3)
-        for chunk in chunks:
-            keys = list(chunk.keys())
-            name = keys[0].split('.')[0]
-            lora_weight = LoraWeight(
-                num_layers=1,
-                in_features=chunk[keys[1]].size(1),
-                out_features=chunk[keys[2]].size(0),
-                lora_rank=lora_rank,
-                dtype=dtype,
-                device=device,
-            )
-            lora_weight.copy_from_tensor(chunk[keys[1]].unsqueeze(0), chunk[keys[2]].unsqueeze(0))
-            lora_weights[name] = lora_weight
-        self.lora_weights = lora_weights
 
 class request(object):
     def __init__(self, 
@@ -75,8 +41,7 @@ class request(object):
         except:
             print('Rank not found')
             rank = 8
-        lora_dict = SDLoraWeight(lora_dict, 32, torch.bfloat16, torch.device("cuda:0"))
-        return lora_dict
+        return {'weights':lora_dict, 'rank':rank}
 
     def get_valuedict(self,model,prompt,negative_prompt):
         keys = list(set([x.input_key for x in state["model"].conditioner.embedders]))
@@ -456,16 +421,12 @@ def sample(model,sampling):
                 for key in dict_list[0]:
                     uc[key] = torch.cat([d[key] for d in dict_list], dim=0)
 
-                lora_weights = []
+                lora_dicts = []
                 for d in sampling:
                     for i in range(d.num):
-                        lora_weights.append(d.lora_dict)  
-                lora_weights = lora_weights * 2
-                lora_dicts = {}
-                for key in lora_weights[0].lora_weights:
-                    lora_dicts[key] = (
-                        BatchedLoraWeight([w.lora_weights[key] for w in lora_weights])
-                    )
+                        lora_dicts.append(d.lora_dict)  
+                lora_dicts = lora_dicts * 2
+                        
                 def denoiser(input, sigma, c, lora_dicts):
                     return state["model"].denoiser.run_with_lora(state["model"].model, input, sigma, c, lora_dicts)
                 samples = sampler.sampler_step_lora(begin,end,denoiser,x,cond,uc, lora_dicts)
